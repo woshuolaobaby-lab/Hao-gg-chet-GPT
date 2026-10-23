@@ -92,6 +92,8 @@ def public_index_daily(kind):
         f = f.rename(columns={'close':'nav'})
     else:
         raise ValueError('不支持的数据类型')
+    if f is None or not isinstance(f,pd.DataFrame) or f.empty:
+        raise ValueError(f'{source}：公开接口返回空值（可能不支持该指数代码、限流或上游接口改变）')
     if not {'date','nav'}.issubset(f.columns):
         raise ValueError('公开接口返回列缺失')
     f=f[['date','nav']].copy()
@@ -104,7 +106,7 @@ def public_index_daily(kind):
     return f,source
 
 def render():
-    st.subheader('⚖️ V14 股债性价比 · 公开接口自动更新与历史检验')
+    st.subheader('⚖️ V14.1 股债性价比 · 白色稳定版')
     st.info('优先尝试公开接口自动获取两端数据。公开接口并非官方授权SLA服务，若无法获得完整、近期且正确口径的全收益数据，将明确提示或切换标注的基金代理模式。')
     st.caption('数据口径：沪深300全收益 H00300.CSI（不是000300价格指数，也不是000984等权指数）；债券端建议中债综合财富指数。官方历史文件上传后可回测至文件最新日期。')
     with st.expander('数据口径、公式和局限（建议先阅读）',expanded=False):
@@ -114,7 +116,9 @@ def render():
     with c2: lo=st.slider('低位分位阈值',5,30,15,5)/100
     with c3: hi=st.slider('高位分位阈值',70,95,85,5)/100
     st.caption('首次访问和缓存到期后自动尝试更新；CSV可覆盖接口结果。数据缓存6小时，更新到数据提供方最新已公布交易日。')
-    mode=st.radio('数据模式',['公开接口自动更新（优先）','基金代理（备用）'],horizontal=True)
+    mode=st.radio('数据模式',['自动模式（官方优先，失败则明确标注基金代理）','严格模式（仅官方数据，不自动降级）','基金代理（备用）'],horizontal=True)
+    strict=mode.startswith('严格')
+    public=not mode.startswith('基金')
     u1,u2=st.columns(2)
     with u1: eqfile=st.file_uploader('官方沪深300全收益CSV（严格模式）',type='csv',key='v12_eq')
     with u2: bondfile=st.file_uploader('中债财富指数CSV（严格模式）',type='csv',key='v12_bond')
@@ -123,22 +127,28 @@ def render():
             notes=[]
             if eqfile:
                 eq=read_csv(eqfile,'官方沪深300全收益'); notes.append('股票：用户上传CSV（需自行核实指数身份）')
-            elif mode.startswith('公开'):
+            elif public:
                 try:
                     eq,src=public_index_daily('equity'); notes.append('股票：'+src)
                 except Exception as err:
-                    st.error(f'沪深300全收益公开接口失败：{err}。已暂停严格模式；可上传官方CSV或选择基金代理。')
-                    return
+                    if strict:
+                        st.error(f'沪深300全收益公开接口失败：{err}。严格模式不允许用代理数据替代。')
+                        return
+                    st.warning(f'沪深300全收益公开接口不可用：{err}。已切换为510300基金代理；该数据不能视为官方沪深300全收益。')
+                    eq=fund_daily('510300'); notes.append('股票：510300 ETF代理（非官方全收益）')
             else:
                 eq=fund_daily('510300'); notes.append('股票：510300 ETF代理，非官方全收益指数')
             if bondfile:
                 bd=read_csv(bondfile,'中债财富指数'); notes.append('债券：用户上传CSV（需自行核实指数身份）')
-            elif mode.startswith('公开'):
+            elif public:
                 try:
                     bd,src=public_index_daily('bond'); notes.append('债券：'+src)
                 except Exception as err:
-                    st.error(f'中债财富指数公开接口失败：{err}。已暂停严格模式；可上传CSV或选择基金代理。')
-                    return
+                    if strict:
+                        st.error(f'中债财富指数公开接口失败：{err}。严格模式不允许用代理数据替代。')
+                        return
+                    st.warning(f'中债财富指数公开接口不可用：{err}。已切换为110008基金代理；该数据不能视为官方债券财富指数。')
+                    bd=fund_daily('110008'); notes.append('债券：110008二级债基代理（非官方债券指数）')
             else:
                 bd=fund_daily('110008'); notes.append('债券：110008二级债基代理，非中债指数')
             st.caption(' | '.join(notes))
@@ -146,6 +156,9 @@ def render():
     except Exception as e:
         st.warning(f'真实历史数据未能取得，暂不生成指标或信号：{e}。可上传两份CSV继续使用。')
         return
+    st.success('股债数据已完成读取和对齐。请检查下方来源与共同日期。')
+    st.caption('数据来源：'+' | '.join(notes))
+    st.caption('股票端最新日期：'+str(eq.date.max().date())+'；债券端最新日期：'+str(bd.date.max().date())+'；共同最新日期：'+str(x.index[-1].date()))
     now=x.iloc[-1]
     a,b,c,d=st.columns(4)
     a.metric('最新股债比',f'{now.ratio:.3f}')
@@ -162,7 +175,7 @@ def render():
     for col,color,name in [('entry','#3bd789','低位预警'),('exit','#fa6262','高位预警')]:
         z=x[x[col]]
         fig.add_trace(go.Scatter(x=z.index,y=z.ratio,mode='markers',name=name,marker=dict(size=8,color=color,symbol='circle'),hovertemplate='%{x|%Y-%m-%d}<br>股债比%{y:.3f}<extra></extra>'),row=2,col=1)
-    fig.update_layout(template='plotly_dark',height=650,margin=dict(l=15,r=15,t=35,b=10),legend=dict(orientation='h',y=1.07),hovermode='x unified')
+    fig.update_layout(template='plotly_white',height=650,margin=dict(l=15,r=15,t=35,b=10),legend=dict(orientation='h',y=1.07),hovermode='x unified')
     fig.update_yaxes(title_text='共同起点=1',row=1,col=1)
     fig.update_yaxes(title_text='股票/债券',row=2,col=1)
     st.plotly_chart(fig,use_container_width=True)
@@ -174,4 +187,4 @@ def render():
     if check in x.index:
         row=x.loc[check]
         st.info(f'2024-09-24 核验：股债比 {row.ratio:.3f}，滚动低位阈值 {row.q_low:.3f}，当日低位预警：{"是" if row.cheap else "否"}。此检验基于当前选定的数据模式，不等同于前一张截图的股债利差上轨突破。' if pd.notna(row.q_low) else '2024-09-24：当日滚动历史样本不足。')
-    st.download_button('下载全部真实计算结果 CSV',x.reset_index().to_csv(index=False).encode('utf-8-sig'),file_name='FundRadar_V12_股债历史核验.csv',mime='text/csv')
+    st.download_button('下载全部真实计算结果 CSV',x.reset_index().to_csv(index=False).encode('utf-8-sig'),file_name='FundRadar_V14_1_股债历史核验.csv',mime='text/csv')
