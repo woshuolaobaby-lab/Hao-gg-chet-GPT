@@ -41,7 +41,9 @@ def wealth(f):
     if f['growth'].notna().sum()>len(f)*.7:
         returns=f['growth']/100
         returns=returns.where(returns.between(-.5,.5))
-        w=(1+returns.fillna(0)).cumprod()
+        if returns.isna().any():
+            raise ValueError('日增长率存在缺失，不能将缺失日期当作0收益复利；请上传完整CSV')
+        w=(1+returns).cumprod()
         # 保持真实日收益复利；第一日设为1
         w=w/w.iloc[0]
     elif f['nav'].notna().sum()>len(f)*.9:
@@ -58,7 +60,9 @@ def analyse(a,b,window=756, min_obs=252,low=.15,high=.85):
     # 严格历史窗口：每一天的阈值只由该日及之前的历史确定
     x['q_low']=x.ratio.shift(1).rolling(window,min_periods=min_obs).quantile(low)
     x['q_high']=x.ratio.shift(1).rolling(window,min_periods=min_obs).quantile(high)
-    x['past_percentile']=x.ratio.shift(1).rolling(window,min_periods=min_obs).apply(lambda v: (v<=v[-1]).mean(),raw=True)
+    # 将当前比值与此前窗口比较，避免错误地计算窗口末日自身的历史分位。
+    history=x.ratio.shift(1).rolling(window,min_periods=min_obs)
+    x['past_percentile']=[float((x.ratio.iloc[max(0,i-window):i] <= x.ratio.iloc[i]).mean()) if i>=min_obs else np.nan for i in range(len(x))]
     x['cheap']=x.ratio<=x.q_low
     x['expensive']=x.ratio>=x.q_high
     x['entry']=x.cheap & ~x.cheap.shift(1,fill_value=False)
@@ -156,7 +160,12 @@ def render():
     except Exception as e:
         st.warning(f'真实历史数据未能取得，暂不生成指标或信号：{e}。可上传两份CSV继续使用。')
         return
-    st.success('股债数据已完成读取和对齐。请检查下方来源与共同日期。')
+    last_common=x.index[-1]
+    age=(pd.Timestamp.now().normalize()-pd.Timestamp(last_common).normalize()).days
+    if age>14:
+        st.warning(f'共同数据截至 {last_common.date()}，已滞后 {age} 天。只显示历史研究结果，不应当作为当日买卖信号。')
+    else:
+        st.success('股债数据已完成读取和对齐。请检查下方来源与共同日期。')
     st.caption('数据来源：'+' | '.join(notes))
     st.caption('股票端最新日期：'+str(eq.date.max().date())+'；债券端最新日期：'+str(bd.date.max().date())+'；共同最新日期：'+str(x.index[-1].date()))
     now=x.iloc[-1]
