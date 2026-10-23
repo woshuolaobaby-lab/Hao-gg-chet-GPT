@@ -1,7 +1,5 @@
-streamlit>=1.40,<2
-streamlit-autorefresh>=1.0.1
-pandas>=2.2,<3
-numpy>=1.26,<3
-requests>=2.32,<3
-plotly>=5.22,<7
-akshare>=1.17,<3
+streamlit>=1.35,<2
+pandas>=2.0,<3
+numpy>=1.24,<3
+requests>=2.31,<3
+plotly>=5.18,<7
