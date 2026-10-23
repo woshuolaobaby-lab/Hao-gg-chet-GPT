@@ -8,7 +8,7 @@ import numpy as np,pandas as pd,requests,streamlit as st
 
 ROOT=Path(__file__).resolve().parent
 HEAD={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36","Referer":"https://fund.eastmoney.com/","Accept":"*/*","Connection":"keep-alive"}
-st.set_page_config(page_title="FundRadar V12 · A股专业资金终端",page_icon="📡",layout="wide")
+st.set_page_config(page_title="FundRadar V14.1 · 白色稳定版",page_icon="📡",layout="wide")
 
 # 原V7的115只基金：内置，防止升级后丢失
 BUILTIN_FUNDS=[
