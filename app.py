@@ -3,10 +3,11 @@ import pandas as pd
 import numpy as np
 import requests, re, json, time
 from datetime import datetime, timezone, timedelta
+from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import plotly.graph_objects as go
 
-st.set_page_config(page_title='FundRadar V15.1 · 大盘监测',page_icon='📡',layout='wide')
+st.set_page_config(page_title='FundRadar V15.2 · 大盘监测',page_icon='📡',layout='wide')
 st.markdown('''<style>.stApp{background:#fff;color:#172033} [data-testid="stSidebar"]{background:#f2f6fc} [data-testid="stMetric"]{background:#f2f6fc;border:1px solid #dde5f0;border-radius:12px;padding:14px} h1,h2,h3{color:#142c50}</style>''',unsafe_allow_html=True)
 TZ=timezone(timedelta(hours=8))
 HEAD={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/123.0 Safari/537.36','Referer':'https://finance.sina.com.cn/','Accept':'*/*'}
@@ -119,6 +120,68 @@ def breadth_sina():
     # 新浪该列表不提供可靠 total；仅允许足够覆盖、无重复的快照，标为部分市场样本，不冒充全A股
     raise RuntimeError(f'新浪列表取得{len(rows)}条，但无法验证全A股覆盖和成交额单位；不用于全市场TRIN')
 
+def breadth_changedist():
+    """Aggregate breadth only. Never infer stock turnover or TRIN from this API."""
+    obj=json.loads(fetch('https://api.ashareapi.com/v1/changedist',timeout=12))
+    if not obj.get('ok') or not isinstance(obj.get('data'),dict):
+        raise RuntimeError('涨跌分布端点未返回有效数据')
+    d=obj['data']
+    # Endpoint schema may change; only accept explicitly named numeric fields.
+    def pick(*keys):
+        for k in keys:
+            if k in d and isinstance(d[k],(int,float)) and not isinstance(d[k],bool):return int(d[k])
+        return None
+    up=pick('up','up_count','rise_count','rising','upCount')
+    down=pick('down','down_count','fall_count','falling','downCount')
+    flat=pick('flat','flat_count','unchanged','flatCount')
+    total=pick('total','total_count','totalCount')
+    if any(x is None or x<0 for x in (up,down,flat)) or (total is not None and up+down+flat>total):
+        raise RuntimeError('返回字段与预期不同，拒绝猜测涨跌家数；请查看原始API文档')
+    if up+down+flat<2500:raise RuntimeError('股票覆盖不足2500只')
+    stamp=str(d.get('date') or d.get('trade_date') or d.get('tradeDate') or '')
+    return {'up':up,'down':down,'flat':flat,'total':up+down+flat,'breadth':up/(up+down+flat)*100,'ad':up/down if down else None,'up_amount':None,'down_amount':None,'ud':None,'trin':None,'rows':None,'source':'AshareAPI 涨跌分布（仅家数）','date':stamp}
+
+def breadth_moneytree():
+    """Daily stock CSV; validate actual schema, full coverage and a single date."""
+    now=datetime.now(TZ)
+    errors=[]
+    for offset in range(0,8):
+        day=(now-timedelta(days=offset)).strftime('%Y%m%d')
+        try:
+            raw=fetch(f'https://money-tree.eyunzhu.com/daily_kline/date/{day}.csv',timeout=15)
+            df=pd.read_csv(StringIO(raw),low_memory=False)
+            cols={str(c).lower().strip():c for c in df.columns}
+            def col(*names):
+                for n in names:
+                    if n in cols:return cols[n]
+                return None
+            code=col('symbol','ts_code','stock_code','code','股票代码','证券代码')
+            name=col('name','stock_name','名称','股票名称')
+            pct=col('pct_chg','change_percent','changepercent','pct_change','涨跌幅','涨跌幅%')
+            amount=col('amount','turnover','成交额','成交额(元)')
+            date=col('trade_date','date','日期')
+            if not all((code,pct,amount)):
+                raise RuntimeError('CSV缺少代码/涨跌幅/成交额字段，不能推断单位：'+','.join(map(str,df.columns[:15])))
+            if date is not None and df[date].astype(str).str.replace('-','').nunique()!=1:
+                raise RuntimeError('CSV混合了多个交易日')
+            # Require explicit unit in column or documented metadata. 'amount' alone ambiguous (yuan vs thousand yuan).
+            if amount not in ('成交额(元)', 'turnover_yuan','amount_yuan'):
+                raise RuntimeError('成交额单位未经确认，拒绝计算TRIN')
+            rows=[{'code':str(x[code]),'name':str(x[name]) if name else '', 'pct':x[pct], 'turnover':x[amount]} for _,x in df.iterrows()]
+            result=parse_stock_rows(rows,len(rows),'MoneyTree '+day)
+            result['date']=day
+            return result
+        except Exception as e:errors.append(day+':'+str(e)[:90])
+    raise RuntimeError(' | '.join(errors[:3]))
+
+@st.cache_data(ttl=900,show_spinner=False)
+def breadth_fallback():
+    errors=[]
+    for label,fn in [('MoneyTree日度CSV',breadth_moneytree),('AshareAPI涨跌分布',breadth_changedist)]:
+        try:return fn(),label,errors
+        except Exception as e:errors.append(label+'：'+str(e)[:160])
+    raise RuntimeError('；'.join(errors))
+
 @st.cache_data(ttl=600,show_spinner=False)
 def breadth():
     errors=[]
@@ -128,6 +191,10 @@ def breadth():
         except Exception as e:errors.append(f'{domain}: {str(e)[:100]}')
     try:return breadth_sina(),datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
     except Exception as e:errors.append('新浪: '+str(e)[:100])
+    try:
+        b,label,previous=breadth_fallback()
+        return b,datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
+    except Exception as e:errors.append('独立备用源: '+str(e)[:240])
     raise RuntimeError('；'.join(errors))
 
 def clean_history(df,source):
@@ -173,20 +240,22 @@ def history(symbol,secid,days=400):
     raise RuntimeError('；'.join(errors))
 
 
-st.sidebar.title('📡 FundRadar V15.1')
+st.sidebar.title('📡 FundRadar V15.2')
 st.sidebar.caption('大盘优先 · 白色版 · 真实数据校验')
 if st.sidebar.button('🔄 立即重新请求全部接口',use_container_width=True):
-    quotes.clear();breadth.clear();history.clear();st.rerun()
+    quotes.clear();breadth.clear();breadth_fallback.clear();history.clear();st.rerun()
 show_breadth=st.sidebar.toggle('获取全市场股票涨跌快照',value=True,help='约6页请求，可能受云端访问限制；默认关闭避免拖慢页面')
 selected=st.sidebar.selectbox('历史趋势指数',list(INDEXES),index=2)
 st.sidebar.caption('报价缓存5分钟；宽度缓存10分钟；历史日线缓存1小时。页面不展示模拟行情。')
+st.sidebar.info('数据通道按模块分别测试；独立涨跌分布源只提供家数时，不会计算TRIN。')
 st.sidebar.warning('云端历史记录不会自动永久保存。请每日下载CSV留档。')
 stock_csv=st.sidebar.file_uploader('可选：导入当日完整股票快照CSV',type=['csv'],help='列名需包含 代码、名称、涨跌幅%、成交额(元)；须是同一交易日的完整A股数据')
 history_csv=st.sidebar.file_uploader('可选：导入指数历史日线CSV',type=['csv'],help='列名需包含 日期、开盘、收盘、最高、最低、成交量')
-st.title('📡 FundRadar V15.1 · A股大盘监测终端')
+st.title('📡 FundRadar V15.2 · A股大盘监测终端')
 st.info('🏃 加载状态：页面运行期间会显示加载动画；下方各模块分别标注成功/失败。所有模块结束后，页面底部显示【本轮加载已结束】。')
 st.caption('优先指数与市场宽度；多源切换、覆盖校验、真实成交额TRIN、接口诊断。行情可能延迟，仅作研究辅助。')
-q,diagnostics,updated=quotes()
+with st.spinner('🏃 正在获取六大指数…'):
+    q,diagnostics,updated=quotes()
 st.subheader('🌏 核心指数行情')
 cols=st.columns(3)
 for i,(name,(symbol,secid)) in enumerate(INDEXES.items()):
@@ -218,14 +287,20 @@ if show_breadth:
             raw=[{'code':x['代码'],'name':x['名称'],'pct':x['涨跌幅%'],'turnover':x['成交额(元)']} for _,x in upload.iterrows()]
             b=parse_stock_rows(raw,len(raw),'用户导入CSV（请核实同日完整覆盖）')
             bt=datetime.now(TZ).strftime('%Y-%m-%d %H:%M:%S')
-        else:b,bt=breadth()
+        else:
+            with st.spinner('🏃 正在逐个测试股票宽广度数据源…'):
+                b,bt=breadth()
+        if b.get('date'):st.caption('数据对应日期：'+str(b['date'])+'；请核对是否为最新交易日')
         c=st.columns(4)
         for col,label,val in zip(c,['上涨/下跌/平盘','上涨占比','涨跌家数比 A/D','成交额TRIN'],[f'{b["up"]}/{b["down"]}/{b["flat"]}',f'{b["breadth"]:.1f}%',f'{b["ad"]:.2f}' if b['ad'] else '缺失',f'{b["trin"]:.2f}' if b['trin'] else '缺失']):col.metric(label,val)
-        st.caption(f'来源 {b["source"]}；完整覆盖 {b["total"]} 只；北京时间 {bt}；上涨成交额 {b["up_amount"]/1e8:.0f} 亿元 / 下跌成交额 {b["down_amount"]/1e8:.0f} 亿元。成交额版TRIN=(上涨家数/下跌家数)/(上涨成交额/下跌成交额)，与成交量版定义不同。')
+        if b['up_amount'] is not None and b['down_amount'] is not None:
+            st.caption(f'来源 {b["source"]}；覆盖 {b["total"]} 只；请求时间 {bt}；上涨成交额 {b["up_amount"]/1e8:.0f} 亿元 / 下跌成交额 {b["down_amount"]/1e8:.0f} 亿元。成交额版TRIN不同于传统成交量版。')
+        else:st.warning('已获取市场涨跌家数，但缺少可核验的逐股成交额，TRIN与成交额结构暂不可用。')
         if b['trin'] and b['trin']>1.2:st.warning('上涨股票相对成交额偏弱（TRIN>1.2）；属于结构警示，不等于机构出货已被证实。')
         elif b['trin'] and b['trin']<0.8:st.success('上涨股票相对成交额较强（TRIN<0.8）；仍须结合趋势和历史分位。')
-        st.dataframe(b['rows'].sort_values('涨跌幅%',ascending=False),hide_index=True,use_container_width=True,height=250)
-        st.download_button('下载本次股票快照 CSV',b['rows'].to_csv(index=False).encode('utf-8-sig'),'A股股票快照.csv','text/csv')
+        if b['rows'] is not None:
+            st.dataframe(b['rows'].sort_values('涨跌幅%',ascending=False),hide_index=True,use_container_width=True,height=250)
+            st.download_button('下载本次股票快照 CSV',b['rows'].to_csv(index=False).encode('utf-8-sig'),'A股股票快照.csv','text/csv')
     except Exception as e:st.warning(f'全市场快照不可用：{str(e)[:230]}。不显示伪造的上涨家数或TRIN。可改用下面的指数趋势判读。')
 else:st.info('默认不请求全市场股票接口。需要涨跌家数和TRIN时，请打开左侧「获取全市场股票涨跌快照」。')
 
@@ -233,7 +308,9 @@ st.subheader('📈 历史趋势 · MA20/MA60 · MACD · RSI')
 try:
     if history_csv is not None:
         df=clean_history(pd.read_csv(history_csv),'用户导入CSV')
-    else:df=history(INDEXES[selected][0],INDEXES[selected][1])
+    else:
+        with st.spinner('🏃 正在获取历史日线…'):
+            df=history(INDEXES[selected][0],INDEXES[selected][1])
     close=df['收盘'];df['MA20']=close.rolling(20).mean();df['MA60']=close.rolling(60).mean()
     e12=close.ewm(span=12,adjust=False).mean();e26=close.ewm(span=26,adjust=False).mean();df['DIF']=e12-e26;df['DEA']=df.DIF.ewm(span=9,adjust=False).mean()
     delta=close.diff();gain=delta.clip(lower=0).ewm(alpha=1/14,adjust=False).mean();loss=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean();df['RSI14']=100-100/(1+gain/loss.replace(0,np.nan))
@@ -254,5 +331,5 @@ with st.expander('展开查看各通道是否成功、报错原因',expanded=not
     st.dataframe(pd.DataFrame(diagnostics,columns=['数据源','状态','有效指数数','错误摘要','请求时间']),hide_index=True,use_container_width=True)
     st.caption('注意：腾讯/新浪/东方财富均为公开网页数据入口，不承诺SLA。云端502、封禁、跨境网络或接口变更均可能导致失败。')
 st.divider()
-st.success('✅ 本轮页面加载已结束。请留意上方黄色错误提示：加载结束不等于全部数据成功。')
-st.caption('FundRadar V15.1 | 不使用模拟价格，不把缺失值当作0，不把ETF代理称为官方沪深300全收益。市场指标仅辅助判断，不构成投资建议。')
+st.success('✅ 本轮页面请求已结束（包括成功与失败模块）。如有黄色警告，说明仍有数据缺失。')
+st.caption('FundRadar V15.2 | 不使用模拟价格，不把缺失值当作0，不把ETF代理称为官方沪深300全收益。市场指标仅辅助判断，不构成投资建议。')
