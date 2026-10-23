@@ -295,21 +295,9 @@ def fund_rt(code):
             return {"price":price,"pct":pct,"time":z.get("gztime","")}
         errors.append("天天基金无返回")
     except Exception as e: errors.append(f"天天基金:{e}")
-    # 腾讯基金基础净值兜底：用于最新值/涨跌，字段随基金类型可能缺失，所以只在可解析时使用
-    try:
-        r=http_get(f"https://qt.gtimg.cn/q=jj{code}",timeout=8,referer="https://fund.qq.com/")
-        txt=r.content.decode("gbk",errors="ignore"); m=re.search(r'="(.*?)"',txt)
-        if m:
-            a=m.group(1).split("~"); nums=[]
-            for v in a:
-                try: nums.append(float(v))
-                except: nums.append(np.nan)
-            vals=[v for v in nums if pd.notna(v) and v>0]
-            if vals:
-                price=vals[-1]
-                return {"price":price,"pct":np.nan,"time":"腾讯基金兜底"}
-        errors.append("腾讯基金无可用净值")
-    except Exception as e: errors.append(f"腾讯基金:{e}")
+    # 腾讯基金报文的字段含义会变化，不能把最后一个正数误作净值。
+    # 如果天天基金无可验证估值，则交给调用方使用有日期的历史净值。
+    errors.append("腾讯基金接口字段未验证，禁止猜测净值")
     raise RuntimeError("基金实时估值2通道失败："+" | ".join(errors))
 
 @st.cache_data(ttl=180,show_spinner=False)
@@ -336,11 +324,9 @@ def sina_quote(code):
 @st.cache_data(ttl=180,show_spinner=False)
 def etf_rt(code):
     code=str(code).zfill(6); errors=[]; secid=("1."+code) if code.startswith(("5","6","68")) else ("0."+code)
-    try:
-        z=(http_get("https://push2.eastmoney.com/api/qt/stock/get",{"secid":secid,"fields":"f43,f58,f169,f170"},timeout=8).json().get("data") or {})
-        if z: return {"price":float(z["f43"]),"pct":float(z["f170"])/100,"channel":"东方财富"}
-        errors.append("东财无返回")
-    except Exception as e: errors.append(f"东财:{e}")
+    # 东财 f43 为整数缩放行情字段，且证券品种缩放因子不同；
+    # 未获得 f59 精度校验前不直接使用，防止价格放大100/1000倍。
+    errors.append("东财实时价精度待校验，改用腾讯/新浪已解码报价")
     try:
         z=tencent_quote(code); z["channel"]="腾讯"; return z
     except Exception as e: errors.append(f"腾讯:{e}")
@@ -475,13 +461,17 @@ def process_one(code,name):
         d,source=get_data(code)
         if len(d)<30: raise RuntimeError("历史数据不足30条")
         x=indicators(d); r=x.iloc[-1]; s,why,risk=score(x); latest=float(r.close); pct=float((r.close/x.close.iloc[-2]-1)*100)
+        history_date=pd.to_datetime(x.index[-1]).normalize()
+        age_days=(pd.Timestamp.now().normalize()-history_date).days
+        if age_days>14:
+            raise RuntimeError(f"历史数据过期（最后日期 {history_date.date()}，距今 {age_days} 天），不生成当前买卖信号")
         try:
             rt=etf_rt(code) if code in ETF_CODES else fund_rt(code) if re.fullmatch(r"\d{6}",code) else None
         except: rt=None
         if rt and pd.notna(rt.get("price")):
-            latest=float(rt["price"]); pct=float(rt["pct"]) if pd.notna(rt.get("pct")) else pct
+            latest=float(rt["price"]); pct=float(rt["pct"]) if pd.notna(rt.get("pct")) else np.nan
         level,level_reason=classify(x,s)
-        out.update({"状态":"正常","数据源":source,"实时通道":rt.get("channel", "天天基金") if rt else "历史数据", "最新值":round(latest,4),"涨跌%":round(pct,2),"评分":s,"买入等级":level,"等级说明":level_reason,"RSI":round(float(r.RSI),2) if pd.notna(r.RSI) else np.nan,"MA5/20":"金叉" if bool(r.MA_GOLDEN) else ("多头" if r.MA5>r.MA20 else "空头"),"MACD":"金叉" if bool(r.MACD_GOLDEN) else ("多头" if r.MACD>r.SIGNAL else "空头"),"MA20趋势":"向上" if pd.notna(r.MA20_SLOPE) and r.MA20_SLOPE>0 else "向下","20日动量%":round(float(r.RET20),2) if pd.notna(r.RET20) else np.nan,"60日动量%":round(float(r.RET60),2) if pd.notna(r.RET60) else np.nan,"回撤%":round(float(r.DD),2) if pd.notna(r.DD) else np.nan,"布林位置%":round(float(r.BB_POS),2) if pd.notna(r.BB_POS) else np.nan,"年化波动%":round(float(r.VOL),2) if pd.notna(r.VOL) else np.nan,"建议":level,"共振理由":why,"风险提示":"、".join(risk) if risk else "暂无明显风险"})
+        out.update({"状态":"正常","数据源":source,"实时通道":rt.get("channel", "天天基金") if rt else "历史数据", "历史数据日期":str(pd.to_datetime(x.index[-1]).date()),"最新值":round(latest,4),"涨跌%":round(pct,2),"评分":s,"买入等级":level,"等级说明":level_reason,"RSI":round(float(r.RSI),2) if pd.notna(r.RSI) else np.nan,"MA5/20":"金叉" if bool(r.MA_GOLDEN) else ("多头" if r.MA5>r.MA20 else "空头"),"MACD":"金叉" if bool(r.MACD_GOLDEN) else ("多头" if r.MACD>r.SIGNAL else "空头"),"MA20趋势":"向上" if pd.notna(r.MA20_SLOPE) and r.MA20_SLOPE>0 else "向下","20日动量%":round(float(r.RET20),2) if pd.notna(r.RET20) else np.nan,"60日动量%":round(float(r.RET60),2) if pd.notna(r.RET60) else np.nan,"回撤%":round(float(r.DD),2) if pd.notna(r.DD) else np.nan,"布林位置%":round(float(r.BB_POS),2) if pd.notna(r.BB_POS) else np.nan,"年化波动%":round(float(r.VOL),2) if pd.notna(r.VOL) else np.nan,"建议":level,"共振理由":why,"风险提示":"、".join(risk) if risk else "暂无明显风险"})
     except Exception as e: out["错误"]=str(e)
     return out
 
@@ -538,7 +528,7 @@ except: pass
 items=load_items()
 if len(items)<153: items=BUILTIN_FUNDS.copy()
 if len({c for c,_ in items}) < 153: items=BUILTIN_FUNDS.copy()
-st.title("📡 FundRadar V12 · A股专业资金终端")
+st.title("📡 FundRadar V14.2 · A股专业资金终端")
 if "channel_probe" in st.session_state:
     with st.expander("🧪 最近一次数据通道实测结果",expanded=True):
         st.dataframe(st.session_state["channel_probe"],use_container_width=True,hide_index=True)
@@ -609,7 +599,7 @@ def terminal_sectors():
     except Exception:return pd.DataFrame()
 
 st.subheader('🖥️ 专业行情全景终端')
-st.caption('黑底终端 · 指数多屏 · 市场宽广度 · TRIN成交额代理指标 · 板块轮动。行情接口可能延迟或受云端限制；未获取到的数据明确显示缺失。')
+st.caption('白色终端 · 指数多屏 · 市场宽广度 · TRIN成交额代理指标 · 板块轮动。行情接口可能延迟或受云端限制；未获取到的数据明确显示缺失。')
 ix=terminal_indices()
 if not ix.empty:
     cs=st.columns(3)
@@ -850,7 +840,7 @@ else:
         st.info(f"当前快捷查看：{qf} · 下面只显示这一类基金")
         view=ok[ok["买入等级"]==qf].sort_values(["评分","20日动量%"],ascending=False)
 
-    cols=["代码","名称","最新值","涨跌%","评分","买入等级","RSI","MA5/20","MACD","MA20趋势","20日动量%","60日动量%","回撤%","年化波动%","等级说明","风险提示"]
+    cols=["代码","名称","历史数据日期","最新值","涨跌%","评分","买入等级","RSI","MA5/20","MACD","MA20趋势","20日动量%","60日动量%","回撤%","年化波动%","等级说明","风险提示"]
     st.dataframe(view[view["评分"]>=threshold][[c for c in cols if c in view.columns]],use_container_width=True,hide_index=True,column_config={"评分":st.column_config.ProgressColumn("技术评分",min_value=0,max_value=100,format="%d")})
 
 with st.expander("📡 数据通道说明 / 本轮实际使用通道"):
@@ -862,5 +852,5 @@ with st.expander(f"⚠️ 数据源诊断（失败 {len(df[df['状态']!='正常
     bad=df[df["状态"]!="正常"] if not df.empty else pd.DataFrame()
     if not bad.empty: st.dataframe(bad[["代码","名称","错误"]],use_container_width=True,hide_index=True)
     else: st.success("本轮153只基金全部成功获取。")
-st.caption(f"V11 专业终端 · 内置153只基金 · 历史缓存24小时 / 实时缓存3-5分钟 · 最后刷新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · 信号仅作辅助，不构成投资建议")
+st.caption(f"V14.2 白色修复版 · 内置153只基金 · 历史缓存24小时 / 实时缓存3-5分钟 · 最后刷新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · 信号仅作辅助，不构成投资建议")
 
