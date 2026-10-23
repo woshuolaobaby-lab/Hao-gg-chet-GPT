@@ -8,7 +8,7 @@ import numpy as np,pandas as pd,requests,streamlit as st
 
 ROOT=Path(__file__).resolve().parent
 HEAD={"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36","Referer":"https://fund.eastmoney.com/","Accept":"*/*","Connection":"keep-alive"}
-st.set_page_config(page_title="基金智能监控雷达 PRO MAX V9",page_icon="📡",layout="wide")
+st.set_page_config(page_title="FundRadar V12 · A股专业资金终端",page_icon="📡",layout="wide")
 
 # 原V7的115只基金：内置，防止升级后丢失
 BUILTIN_FUNDS=[
@@ -468,6 +468,7 @@ def get_data(code):
         return (etf_hist(code),"东方财富ETF K线") if code in ETF_CODES else (fund_hist(code),"东方财富历史净值")
     return yahoo_hist(code),"Yahoo Finance"
 
+@st.cache_data(ttl=300, show_spinner=False)
 def process_one(code,name):
     out={"代码":code,"名称":name,"状态":"失败","错误":""}
     try:
@@ -537,11 +538,167 @@ except: pass
 items=load_items()
 if len(items)<153: items=BUILTIN_FUNDS.copy()
 if len({c for c,_ in items}) < 153: items=BUILTIN_FUNDS.copy()
-st.title("📡 基金智能监控雷达 PRO MAX V9.2")
+st.title("📡 FundRadar V12 · A股专业资金终端")
 if "channel_probe" in st.session_state:
     with st.expander("🧪 最近一次数据通道实测结果",expanded=True):
         st.dataframe(st.session_state["channel_probe"],use_container_width=True,hide_index=True)
 st.caption("153只基金 · 多通道加速稳定版：东方财富 / F10 / 腾讯 / 新浪 / Yahoo 多源备用 · 严格多指标共振：趋势 + MACD + RSI + 20/60日动量 + 回撤 + 波动率 · 买入信号采用硬性门槛")
+
+
+# ===================== V11 专业行情终端 =====================
+import io
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+st.markdown("""<style>
+.stApp {background-color:#080d13;color:#e2e8f0}
+[data-testid="stMetric"] {background:#101b27;border:1px solid #22354a;border-radius:8px;padding:12px}
+[data-testid="stMetricLabel"] {color:#9ab1c8}
+h1,h2,h3 {color:#e4edf9!important}
+[data-testid="stSidebar"] {background:#0d1722}
+</style>""",unsafe_allow_html=True)
+
+INDEXES={"上证指数":"1.000001","深证成指":"0.399001","创业板指":"0.399006","沪深300":"1.000300","科创50":"1.000688","中证2000":"1.932000"}
+
+def _num(x,scale=1):
+    try:
+        v=float(x)
+        return v/scale if math.isfinite(v) else np.nan
+    except: return np.nan
+
+@st.cache_data(ttl=180,show_spinner=False)
+def terminal_indices():
+    result=[]
+    for name,secid in INDEXES.items():
+        try:
+            r=http_get('https://push2.eastmoney.com/api/qt/stock/get',{'secid':secid,'fields':'f43,f57,f58,f169,f170,f47,f48','ut':'fa5fd1943c7b386f172d6893dbfba10b'},timeout=5).json().get('data') or {}
+            if not r or r.get('f43') in (None,'-'): continue
+            result.append({'指数':name,'点位':_num(r.get('f43'),100),'涨跌%':_num(r.get('f170'),100),'成交额(亿)':_num(r.get('f48'),1e8),'来源':'东方财富实时接口'})
+        except Exception: pass
+    return pd.DataFrame(result)
+
+@st.cache_data(ttl=300,show_spinner=False)
+def terminal_market():
+    """逐页拉取A股个股快照。仅成功取得完整页集合时才展示全市场指标。"""
+    data=[]; total=None; page=1; size=500
+    while page<=20:
+        params={'pn':page,'pz':size,'po':1,'np':1,'fltt':2,'invt':2,'fid':'f3','fs':'m:0+t:6,m:0+t:13,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048', 'fields':'f12,f14,f2,f3,f6','ut':'bd1d9ddb04089700cf9c27f6f7426281','_':int(time.time()*1000)}
+        try:
+            obj=http_get('https://push2.eastmoney.com/api/qt/clist/get',params,timeout=12).json().get('data')
+            if not obj or not isinstance(obj.get('diff'),(list,dict)): return pd.DataFrame(), '行情接口未返回有效数据'
+            total=int(obj.get('total',0)); batch=obj['diff']; batch=list(batch.values()) if isinstance(batch,dict) else batch
+            if not batch: break
+            data.extend(batch)
+            if len(data)>=total: break
+            page+=1
+        except Exception as exc: return pd.DataFrame(),f'请求失败：{str(exc)[:90]}'
+    if not total or len(data)<total: return pd.DataFrame(),f'仅取得 {len(data)}/{total} 只股票，暂停计算全市场比例，避免误判'
+    df=pd.DataFrame(data)
+    for c in ('f3','f6'): df[c]=pd.to_numeric(df[c],errors='coerce')
+    df=df.dropna(subset=['f3','f6']).drop_duplicates(subset=['f12'])
+    if len(df)<1000:return pd.DataFrame(),'有效股票数量不足'
+    return df,''
+
+@st.cache_data(ttl=600,show_spinner=False)
+def terminal_sectors():
+    try:
+        obj=http_get('https://push2.eastmoney.com/api/qt/clist/get',{'pn':1,'pz':30,'po':1,'np':1,'fltt':2,'invt':2,'fid':'f3','fs':'m:90+t:2','fields':'f12,f14,f3,f6'},timeout=8).json().get('data') or {}
+        items=obj.get('diff') or []
+        if isinstance(items,dict):items=list(items.values())
+        return pd.DataFrame([{'板块':x.get('f14'),'涨跌%':_num(x.get('f3')),'成交额(亿)':_num(x.get('f6'),1e8)} for x in items])
+    except Exception:return pd.DataFrame()
+
+st.subheader('🖥️ 专业行情全景终端')
+st.caption('黑底终端 · 指数多屏 · 市场宽广度 · TRIN成交额代理指标 · 板块轮动。行情接口可能延迟或受云端限制；未获取到的数据明确显示缺失。')
+ix=terminal_indices()
+if not ix.empty:
+    cs=st.columns(3)
+    for i,(_,r) in enumerate(ix.iterrows()):
+        cs[i%3].metric(r['指数'],f"{r['点位']:,.2f}",f"{r['涨跌%']:+.2f}%" if pd.notna(r['涨跌%']) else None)
+else:st.warning('指数实时接口当前不可用，未使用模拟价格。')
+
+with st.expander('📊 查看指数行情表',expanded=False):
+    if not ix.empty:st.dataframe(ix,use_container_width=True,hide_index=True)
+
+st.markdown('#### 市场宽广度 × 资金成交结构')
+fetch_breadth=st.toggle('获取全市场股票快照（约需数秒；缓存5分钟）',value=False,key='v11_market_toggle')
+if fetch_breadth:
+    with st.spinner('逐页获取市场股票数据，检查是否完整……'):
+        mk,err=terminal_market()
+    if err:st.warning(err)
+    elif not mk.empty:
+        up=mk[mk.f3>0];dn=mk[mk.f3<0];flat=mk[mk.f3==0]
+        nup,ndn,nflat=len(up),len(dn),len(flat)
+        tv_up,tv_dn=up.f6.sum(),dn.f6.sum()
+        breadth=nup/len(mk)*100
+        ad=nup/ndn if ndn else np.nan
+        turnover_ratio=tv_up/tv_dn if tv_dn>0 else np.nan
+        trin=ad/turnover_ratio if pd.notna(ad) and pd.notna(turnover_ratio) and turnover_ratio>0 else np.nan
+        st.session_state['v11_latest']={'时间':datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'上涨家数':nup,'下跌家数':ndn,'平盘家数':nflat,'上涨占比%':round(breadth,2),'涨跌家数比':round(ad,3),'上涨成交额(亿)':round(tv_up/1e8,2),'下跌成交额(亿)':round(tv_dn/1e8,2),'成交额比':round(turnover_ratio,3),'TRIN_成交额代理':round(trin,3)}
+        metrics=st.columns(5)
+        metrics[0].metric('上涨家数',f'{nup:,}')
+        metrics[1].metric('下跌家数',f'{ndn:,}')
+        metrics[2].metric('上涨占比',f'{breadth:.1f}%')
+        metrics[3].metric('上涨/下跌家数',f'{ad:.2f}×')
+        metrics[4].metric('TRIN成交额代理',f'{trin:.2f}' if pd.notna(trin) else '—')
+        a,b=st.columns(2)
+        with a:
+            fig=go.Figure(go.Bar(x=['上涨股票','下跌股票'],y=[tv_up/1e8,tv_dn/1e8],marker_color=['#e65b5b','#20b78a'],text=[f'{tv_up/1e8:.0f}亿',f'{tv_dn/1e8:.0f}亿'],textposition='auto'))
+            fig.update_layout(title='涨跌股票成交额（亿元）',template='plotly_dark',paper_bgcolor='#080d13',plot_bgcolor='#0e1722',height=310)
+            st.plotly_chart(fig,use_container_width=True)
+        with b:
+            fig=go.Figure(go.Pie(labels=['上涨','下跌','平盘'],values=[nup,ndn,nflat],hole=.62,marker_colors=['#e65b5b','#20b78a','#64748b']))
+            fig.update_layout(title='上涨/下跌/平盘家数占比',template='plotly_dark',paper_bgcolor='#080d13',height=310)
+            st.plotly_chart(fig,use_container_width=True)
+        if pd.notna(trin):
+            if breadth>=65 and trin>1.2:st.warning('⚠️ 广度较强但TRIN成交额代理偏高：上涨家数优势未获得同比例的成交额支持，留意量价背离。')
+            elif breadth>=60 and trin<=1:st.success('上涨家数较多，且成交额分布与广度大体匹配；仍需观察后续持续性。')
+            elif breadth<40:st.warning('上涨家数占比不足40%，市场宽广度偏弱。')
+            else:st.info('市场处于混合状态；结合指数走势和连续交易日变化判断。')
+        st.caption('TRIN成交额代理 = (上涨家数/下跌家数) ÷ (上涨股票成交额/下跌股票成交额)。传统TRIN常采用成交量；这里明确使用成交额，不能与成交量口径直接混用。成交额不等于资金净流入，不能单凭它断言主力出货。')
+        st.caption('统计范围为接口筛选出的沪深京A股；剔除无法获得有效涨跌幅或成交额的证券。停牌、新股及不同数据平台的分类规则可能造成差异。')
+
+st.markdown('#### 📈 历史TRIN与宽广度曲线')
+st.caption('上传自行保存的日度数据CSV后可绘制真实历史曲线；不自动补造缺失的涨跌方向成交额。')
+with st.expander('上传历史数据CSV / 查看绘图要求',expanded=False):
+    st.code('日期,上涨家数,下跌家数,平盘家数,上涨成交额,下跌成交额\n2026-09-21,4536,936,81,14952,5531',language='text')
+    st.caption('示例中的成交额数字仅用于说明CSV格式，不代表2026-09-21已核验的数据。两种成交额必须使用同一单位。')
+    hist_file=st.file_uploader('上传CSV（UTF-8）',type=['csv'],key='v11_hist_csv')
+    if hist_file:
+        try:
+            h=pd.read_csv(hist_file)
+            req=['日期','上涨家数','下跌家数','平盘家数','上涨成交额','下跌成交额']
+            if any(c not in h.columns for c in req):raise ValueError('缺少必要列：'+','.join(c for c in req if c not in h.columns))
+            for c in req[1:]:h[c]=pd.to_numeric(h[c],errors='coerce')
+            h['日期']=pd.to_datetime(h['日期'],errors='coerce')
+            h=h.dropna(subset=req).sort_values('日期')
+            h=h[(h['上涨家数']>0)&(h['下跌家数']>0)&(h['上涨成交额']>0)&(h['下跌成交额']>0)]
+            if h.empty:raise ValueError('没有有效的历史数据行')
+            h['上涨占比%']=h['上涨家数']/(h['上涨家数']+h['下跌家数']+h['平盘家数'])*100
+            h['TRIN']= (h['上涨家数']/h['下跌家数'])/(h['上涨成交额']/h['下跌成交额'])
+            fig=make_subplots(specs=[[{'secondary_y':True}]])
+            fig.add_trace(go.Scatter(x=h['日期'],y=h['上涨占比%'],name='上涨占比%',line_color='#f59e0b'),secondary_y=False)
+            fig.add_trace(go.Scatter(x=h['日期'],y=h['TRIN'],name='TRIN成交额代理',line_color='#60a5fa'),secondary_y=True)
+            fig.add_hline(y=1,line_dash='dash',line_color='#94a3b8',secondary_y=True)
+            fig.update_layout(template='plotly_dark',paper_bgcolor='#080d13',plot_bgcolor='#0e1722',height=400)
+            fig.update_yaxes(title_text='上涨占比%',secondary_y=False)
+            fig.update_yaxes(title_text='TRIN',secondary_y=True)
+            st.plotly_chart(fig,use_container_width=True)
+            st.dataframe(h[['日期','上涨占比%','TRIN']],hide_index=True,use_container_width=True)
+        except Exception as e:st.error(f'历史CSV解析失败：{e}')
+
+if 'v11_latest' in st.session_state:
+    record=pd.DataFrame([st.session_state['v11_latest']])
+    st.download_button('⬇️ 导出本次市场快照CSV',record.to_csv(index=False).encode('utf-8-sig'),file_name='A股市场宽广度快照.csv',mime='text/csv')
+
+st.markdown('#### 🔥 行业板块轮动')
+sectors=terminal_sectors()
+if not sectors.empty:
+    st.dataframe(sectors,hide_index=True,use_container_width=True)
+    st.caption('板块涨跌幅与成交额仅用于观察强弱，不等同于板块资金净流入。')
+else:st.info('板块行情接口暂不可用。')
+st.divider()
+# ===================== V11 终端结束 =====================
 
 st.subheader("🌍 大环境 / QQQ / VOO")
 mc=st.columns(6)
@@ -549,6 +706,107 @@ try:
     md=macro_snapshot()
     for col,(_,row) in zip(mc,md.iterrows()): col.metric(row["名称"],"—" if pd.isna(row["评分"]) else int(row["评分"]),row["建议"])
 except: pass
+
+# ===================== 市场宽广度 / Arms(TRIN) / 量价资金系统 =====================
+st.subheader("🧭 全市场宽广度 · Arms(TRIN) · 量价资金背离")
+st.caption("说明：以下 2026-09-21/22 的关键数字来自你提供的视频/文字，作为案例输入展示；未提供的字段不会自动编造。实时全市场统计接口需要在云端验证后才能作为自动数据使用。")
+with st.expander("📐 指标公式与案例演算（展开查看）", expanded=True):
+    st.markdown("""
+**1）市场宽广度（上涨比例）** = 上涨家数 ÷（上涨 + 下跌 + 平盘家数）× 100%
+
+**2）涨跌家数比（A/D）** = 上涨家数 ÷ 下跌家数
+
+**3）上涨/下跌成交额比（U/D Volume）** = 上涨股票成交额 ÷ 下跌股票成交额
+
+**4）阿姆斯指标 Arms / TRIN** =（上涨家数 ÷ 下跌家数）÷（上涨股票成交额 ÷ 下跌股票成交额）。**TRIN 大于 1** 表示下跌股票相对成交额偏重；小于 1 表示上涨股票相对成交额更有量能支持。单日值容易波动，必须结合宽广度趋势、指数位置和连续多日数据判断。
+""")
+
+st.markdown("**案例 A｜2026-09-21（按你提供的数据计算）**")
+c1,c2,c3,c4=st.columns(4)
+adv_pct=c1.number_input("上涨股票占比 %",min_value=0.0,max_value=100.0,value=80.0,step=0.1,key="br_adv_pct")
+dec_pct=c2.number_input("下跌股票占比 %",min_value=0.0,max_value=100.0,value=17.6,step=0.1,key="br_dec_pct")
+down_turn=c3.number_input("下跌股票成交额占比 %",min_value=0.0,max_value=100.0,value=27.0,step=0.1,key="br_down_turn")
+flat_pct=max(0.0,100.0-adv_pct-dec_pct)
+up_turn=100.0-down_turn
+if adv_pct>0 and dec_pct>0 and down_turn>0 and down_turn<100:
+    ad_ratio=adv_pct/dec_pct
+    vol_ratio=up_turn/down_turn
+    trin=ad_ratio/vol_ratio
+    cc1,cc2,cc3,cc4=st.columns(4)
+    cc1.metric("上涨占比",f"{adv_pct:.1f}%")
+    cc2.metric("涨跌家数比 A/D",f"{ad_ratio:.2f}:1")
+    cc3.metric("涨跌成交额比 U/D",f"{vol_ratio:.2f}:1")
+    cc4.metric("计算 Arms / TRIN",f"{trin:.2f}","量能相对偏弱" if trin>1 else "量能相对支持")
+    st.info(f"平盘占比约 {flat_pct:.1f}%；上涨成交额占比按剩余值估算为 {up_turn:.1f}%。按这些输入计算，TRIN={ad_ratio:.2f}÷{vol_ratio:.2f}={trin:.2f}，与您提到的 1.69 基本一致（差异来自输入值四舍五入）。")
+
+st.markdown("**案例 B｜2026-09-22（按你提供的数据）**")
+b1,b2,b3=st.columns(3)
+adv_next=b1.number_input("次日上涨股票占比 %",min_value=0.0,max_value=100.0,value=43.7,step=0.1,key="br_next_adv")
+dec_next=b2.number_input("次日下跌股票占比 %（未提供时请填入）",min_value=0.0,max_value=100.0,value=0.0,step=0.1,key="br_next_dec")
+trin_next=b3.number_input("次日 Arms/TRIN（未提供时填 0）",min_value=0.0,max_value=10.0,value=0.0,step=0.01,key="br_next_trin")
+if dec_next>0:
+    st.metric("次日涨跌家数比 A/D",f"{adv_next/dec_next:.2f}:1")
+else:
+    st.caption("次日下跌占比未提供，因此不计算次日 A/D 或 TRIN，避免把未知数当成事实。")
+
+# Visuals: keep separate scales to avoid misleading overlays.
+chart_df=pd.DataFrame({"日期":["09-21","09-22"],"上涨股票占比(%)":[adv_pct,adv_next]}).set_index("日期")
+st.markdown("**图 1｜市场宽广度：上涨股票占比**")
+st.line_chart(chart_df, y="上涨股票占比(%)", use_container_width=True)
+vol_df=pd.DataFrame({"类别":["上涨股票成交额占比","下跌股票成交额占比"],"占比(%)":[up_turn,down_turn]}).set_index("类别")
+st.markdown("**图 2｜09-21 成交额分布（由你提供的 27% 下跌成交额推算）**")
+st.bar_chart(vol_df, y="占比(%)", use_container_width=True)
+trin_df=pd.DataFrame({"日期":["09-21","09-22"],"Arms/TRIN":[round(trin,2) if adv_pct>0 and dec_pct>0 and 0<down_turn<100 else None, trin_next if trin_next>0 else None]}).set_index("日期")
+st.markdown("**图 3｜Arms/TRIN（空白表示没有足够数据，不代表 0）**")
+st.line_chart(trin_df, y="Arms/TRIN", use_container_width=True)
+
+st.markdown("**量价/资金解读（案例假设，不是对真实历史行情的独立核验）**")
+st.markdown(f"""
+- 09-21：上涨占比 {adv_pct:.1f}%，下跌占比 {dec_pct:.1f}%，下跌股票成交额占比 {down_turn:.1f}%。按比例推算，上涨/下跌家数比为 **{(adv_pct/dec_pct if dec_pct else 0):.2f}**，上涨/下跌成交额比为 **{(up_turn/down_turn if down_turn else 0):.2f}**，TRIN 约 **{(trin if adv_pct>0 and dec_pct>0 and 0<down_turn<100 else float('nan')):.2f}**。
+- 这意味着上涨股票数量明显占优，但下跌股票以较少家数承载了相对较高的成交额；若同时出现指数上涨乏力、权重股放量走弱，属于**广度强、成交额结构不均衡的风险提示**，可以称为潜在量价/资金背离，不能单凭 TRIN 就断言“权重正在出货”。
+- 09-22：你提供的上涨占比从 80% 降至 43.7%，下降 **{adv_pct-adv_next:.1f} 个百分点**。这是广度急剧恶化的信号；但要验证“权重松手导致市场转弱”，还需要当天指数涨跌、上涨/下跌成交额、主要权重股成交额和涨跌家数完整数据。
+- **操作规则建议**：TRIN > 1 且宽广度连续回落、指数跌破短期趋势时提高风险等级；TRIN < 1 且上涨占比扩张、指数/成交额同步走强时，量价确认较好。用 3–5 日滚动均值过滤单日噪声，不能把单一阈值当成买卖指令。
+""")
+
+# ===================== 公开来源历史行情核验 =====================
+st.subheader("🗂️ A股近期历史行情：公开数据核验与量价论证")
+st.caption("以下为公开网页报道的历史快照，不是实时行情。不同网站的统计范围（是否含北交所、ST、停牌股）可能不同；同一组前后比较优先采用同一来源。公开报道未给出涨跌股票分方向成交额时，不计算 TRIN。")
+market_records = [
+    {"日期":"2026-09-21", "上涨家数":4536, "下跌家数":936, "平盘家数":81, "成交额(亿元)":20483, "上证涨跌幅(%)":0.97, "来源":"东方财富号复盘", "url":"https://caifuhao.eastmoney.com/news/20260921154815097111860"},
+    {"日期":"2026-10-20", "上涨家数":3778, "下跌家数":1666, "平盘家数":None, "成交额(亿元)":14561.1, "上证涨跌幅(%)":0.12, "来源":"连板网日度归档", "url":"https://lianbanwang.com/days/2026-10-20.html"},
+    {"日期":"2026-10-21", "上涨家数":1981, "下跌家数":3364, "平盘家数":None, "成交额(亿元)":14293.5, "上证涨跌幅(%)":-0.60, "来源":"连板网日度归档", "url":"https://lianbanwang.com/days/2026-10-21.html"},
+]
+market_df = pd.DataFrame(market_records)
+market_df["上涨占比(%)"] = (market_df["上涨家数"]/(market_df["上涨家数"]+market_df["下跌家数"]+market_df["平盘家数"].fillna(0))*100).round(2)
+market_df["涨跌家数比"] = (market_df["上涨家数"]/market_df["下跌家数"]).round(2)
+show_df = market_df[["日期","上涨家数","下跌家数","平盘家数","上涨占比(%)","涨跌家数比","成交额(亿元)","上证涨跌幅(%)","来源"]]
+st.dataframe(show_df, use_container_width=True, hide_index=True)
+st.markdown("**公开来源：** [2026-09-21复盘（东方财富号）](https://caifuhao.eastmoney.com/news/20260921154815097111860) · [2026-10-20行情归档](https://lianbanwang.com/days/2026-10-20.html) · [2026-10-21行情归档](https://lianbanwang.com/days/2026-10-21.html) · [TRIN公式说明（Fidelity）](https://www.fidelity.com/learning-center/trading-investing/technical-analysis/technical-indicator-guide/trin)")
+trend = market_df[market_df["日期"].isin(["2026-10-20","2026-10-21"])].copy().set_index("日期")
+if not trend.empty:
+    st.markdown("**图 4｜近期上涨/下跌家数：普涨修复后是否快速转弱**")
+    st.line_chart(trend[["上涨家数","下跌家数"]], use_container_width=True)
+    st.markdown("**图 5｜市场成交额与上证指数涨跌幅（不同单位分开显示）**")
+    cvol, cidx = st.columns(2)
+    cvol.bar_chart(trend[["成交额(亿元)"]], use_container_width=True)
+    cidx.bar_chart(trend[["上证涨跌幅(%)"]], use_container_width=True)
+    if len(trend) == 2:
+        first, last = trend.iloc[0], trend.iloc[1]
+        adv_change = int(last["上涨家数"] - first["上涨家数"])
+        dec_change = int(last["下跌家数"] - first["下跌家数"])
+        breadth_first = float(first["上涨占比(%)"])
+        breadth_last = float(last["上涨占比(%)"])
+        turnover_change = float(last["成交额(亿元)"] - first["成交额(亿元)"])
+        st.markdown(f"""**自动论证｜2026-10-20 → 2026-10-21**
+- 上涨家数变化：**{adv_change:+,}**；下跌家数变化：**{dec_change:+,}**。
+- 上涨占比从 **{breadth_first:.1f}%** 降到 **{breadth_last:.1f}%**，变化 **{breadth_last-breadth_first:+.1f} 个百分点**。
+- 两市成交额变化约 **{turnover_change:+,.1f} 亿元**，而上证指数从 **{first['上证涨跌幅(%)']:+.2f}%** 转为 **{last['上证涨跌幅(%)']:+.2f}%**。
+
+**解读：** 这组数据支持“10月20日普涨修复、10月21日广度明显恶化”的判断；成交额只是小幅下降，说明广度转弱并非单纯由成交额骤降造成。它本身不能证明权重股出货。若要确认阿姆斯/TRIN，必须取得同一统计范围下上涨股票成交额总和与下跌股票成交额总和；当前公开摘要没有这两项拆分，所以本模块不伪造 TRIN。""")
+st.caption("统计口径提示：2026-09-21来源报告上涨4536、下跌936、平盘81；另一公开归档对沪深剔除北交所采用不同家数。为避免混用口径，本表将来源差异保留为来源注记。2026-10-20/21用于相邻交易日比较。")
+
+from relative_value import render as render_relative_value
+render_relative_value()
 
 st.subheader("🔥 今日决策中心")
 bar=st.progress(0,f"正在获取{len(items)}只基金数据……"); rows=[]
@@ -604,5 +862,5 @@ with st.expander(f"⚠️ 数据源诊断（失败 {len(df[df['状态']!='正常
     bad=df[df["状态"]!="正常"] if not df.empty else pd.DataFrame()
     if not bad.empty: st.dataframe(bad[["代码","名称","错误"]],use_container_width=True,hide_index=True)
     else: st.success("本轮153只基金全部成功获取。")
-st.caption(f"V9.2 多通道加速版 · 内置153只基金 · 历史缓存24小时 / 实时缓存3-5分钟 · 最后刷新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · 信号仅作辅助，不构成投资建议")
+st.caption(f"V11 专业终端 · 内置153只基金 · 历史缓存24小时 / 实时缓存3-5分钟 · 最后刷新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} · 信号仅作辅助，不构成投资建议")
 
