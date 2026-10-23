@@ -551,11 +551,11 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 st.markdown("""<style>
-.stApp {background-color:#080d13;color:#e2e8f0}
-[data-testid="stMetric"] {background:#101b27;border:1px solid #22354a;border-radius:8px;padding:12px}
-[data-testid="stMetricLabel"] {color:#9ab1c8}
-h1,h2,h3 {color:#e4edf9!important}
-[data-testid="stSidebar"] {background:#0d1722}
+.stApp {background-color:#ffffff !important;color:#172033 !important}
+[data-testid="stMetric"] {background:#f3f6fa;border:1px solid #dce4ee;border-radius:8px;padding:12px}
+[data-testid="stMetricLabel"] {color:#475569 !important}
+h1,h2,h3 {color:#172033!important}
+[data-testid="stSidebar"] {background:#f3f6fa !important}
 </style>""",unsafe_allow_html=True)
 
 INDEXES={"上证指数":"1.000001","深证成指":"0.399001","创业板指":"0.399006","沪深300":"1.000300","科创50":"1.000688","中证2000":"1.932000"}
@@ -644,11 +644,11 @@ if fetch_breadth:
         a,b=st.columns(2)
         with a:
             fig=go.Figure(go.Bar(x=['上涨股票','下跌股票'],y=[tv_up/1e8,tv_dn/1e8],marker_color=['#e65b5b','#20b78a'],text=[f'{tv_up/1e8:.0f}亿',f'{tv_dn/1e8:.0f}亿'],textposition='auto'))
-            fig.update_layout(title='涨跌股票成交额（亿元）',template='plotly_dark',paper_bgcolor='#080d13',plot_bgcolor='#0e1722',height=310)
+            fig.update_layout(title='涨跌股票成交额（亿元）',template='plotly_white',paper_bgcolor='#ffffff',plot_bgcolor='#ffffff',height=310)
             st.plotly_chart(fig,use_container_width=True)
         with b:
             fig=go.Figure(go.Pie(labels=['上涨','下跌','平盘'],values=[nup,ndn,nflat],hole=.62,marker_colors=['#e65b5b','#20b78a','#64748b']))
-            fig.update_layout(title='上涨/下跌/平盘家数占比',template='plotly_dark',paper_bgcolor='#080d13',height=310)
+            fig.update_layout(title='上涨/下跌/平盘家数占比',template='plotly_white',paper_bgcolor='#ffffff',height=310)
             st.plotly_chart(fig,use_container_width=True)
         if pd.notna(trin):
             if breadth>=65 and trin>1.2:st.warning('⚠️ 广度较强但TRIN成交额代理偏高：上涨家数优势未获得同比例的成交额支持，留意量价背离。')
@@ -680,7 +680,7 @@ with st.expander('上传历史数据CSV / 查看绘图要求',expanded=False):
             fig.add_trace(go.Scatter(x=h['日期'],y=h['上涨占比%'],name='上涨占比%',line_color='#f59e0b'),secondary_y=False)
             fig.add_trace(go.Scatter(x=h['日期'],y=h['TRIN'],name='TRIN成交额代理',line_color='#60a5fa'),secondary_y=True)
             fig.add_hline(y=1,line_dash='dash',line_color='#94a3b8',secondary_y=True)
-            fig.update_layout(template='plotly_dark',paper_bgcolor='#080d13',plot_bgcolor='#0e1722',height=400)
+            fig.update_layout(template='plotly_white',paper_bgcolor='#ffffff',plot_bgcolor='#ffffff',height=400)
             fig.update_yaxes(title_text='上涨占比%',secondary_y=False)
             fig.update_yaxes(title_text='TRIN',secondary_y=True)
             st.plotly_chart(fig,use_container_width=True)
